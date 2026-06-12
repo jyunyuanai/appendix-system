@@ -24,7 +24,7 @@ APP_DIR = Path(__file__).resolve().parent
 APPENDIX_NAMES = ["附錄一", "附錄二", "附錄三", "附錄四", "附錄五", "附錄六"]
 DEFAULT_WORK_ITEMS = ["放樣", "開挖", "回填", "便道"]
 UI_MASCOT_IMAGE = APP_DIR / "assets" / "ui_mascots.png"
-PREPARE_CACHE_VERSION = 37
+PREPARE_CACHE_VERSION = 38
 MAX_PREPARE_WORKERS = 4
 MAX_OUTPUT_WORKERS = 6
 APPENDIX_CODE_PREFIXES = ["A", "B", "C", "D", "E", "F"]
@@ -2159,8 +2159,14 @@ def section_has_requested_work_item_text(section: dict, work_item: str) -> bool:
     return False
 
 
-def section_can_match_requested_work_item(section: dict, work_item: str) -> bool:
+def section_can_match_requested_work_item(
+    section: dict,
+    work_item: str,
+    appendix_number: int | None = None,
+) -> bool:
     if section.get("assignment_source") != "toc_order":
+        return True
+    if appendix_number != 3:
         return True
     return section_has_requested_work_item_text(section, work_item)
 
@@ -2181,7 +2187,11 @@ def select_indexed_sections(
             if section_index in used_section_indexes:
                 continue
             if same_work_item_identity(section["work_item"], work_item):
-                if not section_can_match_requested_work_item(section, work_item):
+                if not section_can_match_requested_work_item(
+                    section,
+                    work_item,
+                    appendix_number,
+                ):
                     continue
                 matched_index = section_index
                 break
@@ -2191,7 +2201,11 @@ def select_indexed_sections(
                 if section_index in used_section_indexes:
                     continue
                 if same_work_item_name(section["work_item"], work_item):
-                    if not section_can_match_requested_work_item(section, work_item):
+                    if not section_can_match_requested_work_item(
+                        section,
+                        work_item,
+                        appendix_number,
+                    ):
                         continue
                     matched_index = section_index
                     break
@@ -2206,6 +2220,7 @@ def select_indexed_sections(
                         if not section_can_match_requested_work_item(
                             section,
                             fallback_work_item,
+                            appendix_number,
                         ):
                             continue
                         matched_index = section_index
@@ -3128,8 +3143,10 @@ current_output_signature = (
     tuple(output_work_items),
     project_name.strip(),
 )
-if st.session_state.get("outputs_signature") != current_output_signature:
-    st.session_state.pop("outputs", None)
+outputs_are_current = (
+    st.session_state.get("outputs_signature") == current_output_signature
+    and bool(st.session_state.get("outputs"))
+)
 
 _, action_column = st.columns([1, 2.2], gap="large")
 with action_column:
@@ -3138,7 +3155,9 @@ with action_column:
         complete_clicked = st.button("完成", type="primary", use_container_width=True)
 
 if complete_clicked:
-    if len(uploaded_files) != len(APPENDIX_NAMES):
+    if outputs_are_current:
+        st.success("已沿用上次產出結果，可直接下載。")
+    elif len(uploaded_files) != len(APPENDIX_NAMES):
         st.error("請先一次上傳 6 個 Word 檔案。")
     elif any(upload["docx_bytes"] is None for upload in prepared_uploads):
         st.error("有檔案無法讀取或轉換，請確認 Word 檔案格式後重新上傳。")
@@ -3337,7 +3356,18 @@ if complete_clicked:
             st.success("處理完成，請分別下載 6 個 Word 檔案。")
 
 if "outputs" in st.session_state:
-    st.subheader("輸出下載")
+    outputs_match_current = (
+        st.session_state.get("outputs_signature") == current_output_signature
+    )
+    output_title = "輸出下載" if outputs_match_current else "上次輸出下載"
+    title_column, clear_column = st.columns([4, 1])
+    with title_column:
+        st.subheader(output_title)
+    with clear_column:
+        if st.button("清除輸出", key="clear_outputs", use_container_width=True):
+            st.session_state.pop("outputs", None)
+            st.session_state.pop("outputs_signature", None)
+            st.rerun()
     download_rows = [st.columns(3), st.columns(3)]
     for index, output in enumerate(st.session_state["outputs"]):
         column = download_rows[index // 3][index % 3]
@@ -3348,4 +3378,5 @@ if "outputs" in st.session_state:
                 file_name=output["file_name"],
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 key=f"download_{index + 1}",
+                on_click="ignore",
             )
