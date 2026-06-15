@@ -3,9 +3,7 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
-import hmac
 import io
-import os
 import re
 import shutil
 import subprocess
@@ -20,28 +18,16 @@ from docx.oxml.ns import qn
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 from lxml import etree
-from word_refresh_backend import refresh_docx_fields_via_service
-from word_refresh_backend import refresh_docx_fields_with_local_word
 
 
 APP_DIR = Path(__file__).resolve().parent
 APPENDIX_NAMES = ["附錄一", "附錄二", "附錄三", "附錄四", "附錄五", "附錄六"]
 DEFAULT_WORK_ITEMS = ["放樣", "開挖", "回填", "便道"]
 UI_MASCOT_IMAGE = APP_DIR / "assets" / "ui_mascots.png"
-PREPARE_CACHE_VERSION = 50
+PREPARE_CACHE_VERSION = 31
 MAX_PREPARE_WORKERS = 4
 MAX_OUTPUT_WORKERS = 6
 APPENDIX_CODE_PREFIXES = ["A", "B", "C", "D", "E", "F"]
-APPENDIX_CODE_LABEL_TEXTS = {
-    "編號",
-    "表單編號",
-    "抽查編號",
-    "查驗編號",
-    "檢驗編號",
-    "紀錄編號",
-    "記錄編號",
-    "文件編號",
-}
 WORD_NAMESPACE = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 RELATIONSHIP_NAMESPACE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 WORD_NAMESPACES = {"w": WORD_NAMESPACE, "r": RELATIONSHIP_NAMESPACE}
@@ -52,45 +38,6 @@ W_TC = f"{{{WORD_NAMESPACE}}}tc"
 W_T = f"{{{WORD_NAMESPACE}}}t"
 W_SECTPR = f"{{{WORD_NAMESPACE}}}sectPr"
 WORD_COM_LOCK = threading.Lock()
-
-
-def get_secret_setting(name: str, default: str = "") -> str:
-    env_value = os.environ.get(name)
-    if env_value is not None and str(env_value).strip():
-        return str(env_value).strip()
-
-    try:
-        secret_value = st.secrets.get(name, default)
-    except Exception:
-        secret_value = default
-
-    if secret_value is None:
-        return default
-    return str(secret_value).strip()
-
-
-def require_app_password() -> None:
-    app_password = get_secret_setting("APP_PASSWORD")
-    if not app_password:
-        return
-    if st.session_state.get("app_password_ok"):
-        return
-
-    st.title("監造附錄六合一產出系統")
-    st.caption("請先輸入密碼")
-
-    with st.form("app_password_form"):
-        password_input = st.text_input("密碼", type="password")
-        submitted = st.form_submit_button("登入", use_container_width=True)
-
-    if submitted:
-        if hmac.compare_digest(password_input, app_password):
-            st.session_state["app_password_ok"] = True
-            st.rerun()
-        else:
-            st.error("密碼錯誤。")
-
-    st.stop()
 TOC_WORK_ITEM_SUFFIXES = [
     "工程施工安全衛生抽查管理標準表",
     "工程施工安全衛生查驗管理標準表",
@@ -224,86 +171,21 @@ def worker_count(item_count: int, limit: int) -> int:
     return max(1, min(item_count, limit))
 
 
-def appendix_position_from_filename(file_name: str) -> int | None:
-    text = Path(file_name).stem
-    number_texts = {
-        "1": 0,
-        "01": 0,
-        "１": 0,
-        "一": 0,
-        "壹": 0,
-        "2": 1,
-        "02": 1,
-        "２": 1,
-        "二": 1,
-        "貳": 1,
-        "3": 2,
-        "03": 2,
-        "３": 2,
-        "三": 2,
-        "參": 2,
-        "4": 3,
-        "04": 3,
-        "４": 3,
-        "四": 3,
-        "肆": 3,
-        "5": 4,
-        "05": 4,
-        "５": 4,
-        "五": 4,
-        "伍": 4,
-        "6": 5,
-        "06": 5,
-        "６": 5,
-        "六": 5,
-        "陸": 5,
-    }
-    match = re.search(r"附錄\s*[-_（(]*\s*([0０]?[1-6１-６一二三四五六壹貳參肆伍陸])", text)
-    if not match:
-        return None
-    return number_texts.get(match.group(1))
-
-
-def toc_source_position_from_payloads(payloads: list[dict]) -> int:
-    for payload in payloads:
-        if appendix_position_from_filename(payload["name"]) == 0:
-            return int(payload["position"])
-    return 0
-
-
 def uploaded_file_payloads(uploaded_files) -> list[dict]:
-    payloads_by_position = {}
-    fallback_payloads = []
+    payloads = []
     for index, uploaded_file in enumerate(uploaded_files[: len(APPENDIX_NAMES)]):
         file_bytes = uploaded_file.getvalue()
-        payload = {
-            "position": index,
-            "name": uploaded_file.name,
-            "bytes": file_bytes,
-            "size": len(file_bytes),
-            "type": getattr(uploaded_file, "type", ""),
-            "digest": bytes_digest(file_bytes),
-        }
-        file_position = appendix_position_from_filename(uploaded_file.name)
-        if file_position is not None and file_position not in payloads_by_position:
-            payload["position"] = file_position
-            payloads_by_position[file_position] = payload
-        else:
-            fallback_payloads.append(payload)
-
-    available_positions = [
-        position
-        for position in range(len(APPENDIX_NAMES))
-        if position not in payloads_by_position
-    ]
-    for payload, position in zip(fallback_payloads, available_positions):
-        payload["position"] = position
-        payloads_by_position[position] = payload
-
-    return [
-        payloads_by_position[position]
-        for position in sorted(payloads_by_position)
-    ]
+        payloads.append(
+            {
+                "position": index,
+                "name": uploaded_file.name,
+                "bytes": file_bytes,
+                "size": len(file_bytes),
+                "type": getattr(uploaded_file, "type", ""),
+                "digest": bytes_digest(file_bytes),
+            }
+        )
+    return payloads
 
 
 def uploaded_payloads_signature(payloads: list[dict]) -> tuple[tuple[str, int, str, str], ...]:
@@ -680,6 +562,7 @@ def appendix_boundary_work_items(
         unique_work_items(
             list(prepared_upload.get("work_items") or [])
             + list(output_work_items)
+            + DEFAULT_WORK_ITEMS
         )
     )
 
@@ -768,14 +651,11 @@ def canonical_work_item_name(text: str) -> str:
         "便道設施": "便道",
         "擋土墻": "擋土牆",
     }
+    if normalized.startswith("石籠"):
+        return "石籠"
     if normalized in ("瀝青混凝土鋪面", "混凝土鋪面"):
         return f"{normalized}工程"
     return default_aliases.get(normalized, normalized)
-
-
-def work_item_identity_key(text: str) -> str:
-    cleaned = to_work_item_name(strip_toc_row_noise(text))
-    return normalize_match_text(cleaned).replace("舖面", "鋪面")
 
 
 def unique_work_items(work_items: list[str]) -> list[str]:
@@ -783,11 +663,11 @@ def unique_work_items(work_items: list[str]) -> list[str]:
     seen = set()
     for work_item in work_items:
         cleaned = to_work_item_name(strip_toc_row_noise(work_item))
-        identity_key = work_item_identity_key(cleaned)
-        if not cleaned or not identity_key or identity_key in seen:
+        canonical = canonical_work_item_name(cleaned)
+        if not cleaned or not canonical or canonical in seen:
             continue
-        seen.add(identity_key)
-        unique_items.append(cleaned)
+        seen.add(canonical)
+        unique_items.append(canonical)
     return unique_items
 
 
@@ -819,38 +699,13 @@ def normalized_section_work_item_matches_title(
     normalized_title: str,
     normalized_work_item: str,
 ) -> bool:
-    return normalized_work_item_matches_title(normalized_title, normalized_work_item)
-
-
-def normalized_text_contains_work_item_near_start(
-    normalized_text: str,
-    normalized_work_item: str,
-) -> bool:
-    if not normalized_text or not normalized_work_item:
+    if normalized_work_item_matches_title(normalized_title, normalized_work_item):
+        return True
+    if "鋪面工程" in normalized_title or "鋪面工程" in normalized_work_item:
         return False
-
-    # 只允許「真正從開頭開始」的工項名稱，避免把
-    # 「瀝青混凝土鋪面工程」誤判成「混凝土鋪面工程」。
-    leading_text = re.sub(r"^(?:[A-Fa-f]\d{1,3}|\d{1,3})", "", normalized_text)
-    return leading_text.startswith(normalized_work_item)
-
-
-def work_item_from_near_start_text(
-    text: str,
-    normalized_work_items: list[tuple[str, str]],
-) -> str | None:
-    normalized_text = normalize_match_text(text).replace("舖面", "鋪面")
-    matches = [
-        (len(normalized_work_item), work_item)
-        for work_item, normalized_work_item in normalized_work_items
-        if normalized_text_contains_work_item_near_start(
-            normalized_text,
-            normalized_work_item,
-        )
-    ]
-    if not matches:
-        return None
-    return max(matches, key=lambda item: item[0])[1]
+    if len(normalized_work_item) < 2:
+        return False
+    return normalized_title.endswith(normalized_work_item)
 
 
 def work_item_title_matches(text: str, work_item: str) -> bool:
@@ -863,24 +718,20 @@ def work_item_matches(text: str, work_item: str) -> bool:
     return work_item_title_matches(text, work_item)
 
 
-def same_work_item_identity(left: str, right: str) -> bool:
-    left_key = work_item_identity_key(left)
-    right_key = work_item_identity_key(right)
-    return bool(left_key and right_key and left_key == right_key)
-
-
 def same_work_item_name(left: str, right: str) -> bool:
-    if same_work_item_identity(left, right):
-        return True
     return canonical_work_item_name(left) == canonical_work_item_name(right)
 
 
-def is_default_work_item_option(work_item: str) -> bool:
-    return any(
-        same_work_item_name(work_item, default_work_item)
-        for default_work_item in DEFAULT_WORK_ITEMS
-    )
+def is_asphalt_pavement_item(work_item: str) -> bool:
+    return canonical_work_item_name(work_item) == "瀝青混凝土鋪面工程"
 
+
+def pavement_fallback_work_items(work_item: str) -> list[str]:
+    # 附錄四、五、六如果沒有「瀝青混凝土鋪面工程」，
+    # 允許先抓「混凝土鋪面工程」當底稿，後面再把文字改成瀝青。
+    if is_asphalt_pavement_item(work_item):
+        return ["混凝土鋪面工程", "混凝土鋪面"]
+    return []
 
 def work_item_sort_key(work_item: str) -> tuple[int, str]:
     """
@@ -899,6 +750,8 @@ def work_item_sort_key(work_item: str) -> tuple[int, str]:
         return (int(match.group(1)), normalize_match_text(text))
 
     return (9999, normalize_match_text(text))
+def is_default_work_item(work_item: str) -> bool:
+    return any(work_item_matches(work_item, default_item) for default_item in DEFAULT_WORK_ITEMS)
 
 
 def is_toc_table(table: Table) -> bool:
@@ -922,11 +775,6 @@ def is_toc_header_row(text: str) -> bool:
 
 def row_matches_work_item(text: str, work_items: list[str]) -> bool:
     return any(work_item_matches(text, work_item) for work_item in work_items)
-
-
-def toc_entry_matches_work_item_identity(entry_text: str, work_item: str) -> bool:
-    entry_work_item = to_work_item_name(strip_toc_row_noise(entry_text))
-    return same_work_item_identity(entry_work_item, work_item)
 
 
 def set_cell_text_preserving_first_run(cell, text: str) -> None:
@@ -1131,53 +979,6 @@ def xml_first_table_paragraph_text(element) -> str:
     return fallback_text
 
 
-def xml_title_candidate_texts(element) -> list[tuple[str, str]]:
-    if element.tag == W_P:
-        return [(xml_element_text(element), xml_paragraph_style(element))]
-
-    title_candidates = []
-    for paragraph in element.xpath(".//w:p", namespaces=WORD_NAMESPACES):
-        text = xml_element_text(paragraph)
-        if text:
-            title_candidates.append((text, xml_paragraph_style(paragraph)))
-    return title_candidates
-
-
-def text_looks_like_section_title(
-    text: str,
-    style_name: str = "",
-    require_suffix: bool = False,
-) -> bool:
-    cleaned_text = clean_toc_text(text)
-    if not cleaned_text or len(cleaned_text) > 160:
-        return False
-
-    has_title_suffix = any(suffix in cleaned_text for suffix in TOC_WORK_ITEM_SUFFIXES)
-    if require_suffix:
-        return has_title_suffix
-
-    has_title_style = style_name.startswith("Heading") or style_name.startswith("標題")
-    return has_title_suffix or has_title_style
-
-
-def xml_section_title_work_items(element) -> list[str]:
-    work_items = []
-    for text, style_name in xml_title_candidate_texts(element):
-        if element.tag == W_P and is_toc_candidate(text, style_name):
-            continue
-        if not text_looks_like_section_title(
-            text,
-            style_name,
-            require_suffix=(element.tag == W_TBL),
-        ):
-            continue
-
-        work_item = to_work_item_name(clean_toc_text(text))
-        if work_item:
-            work_items.append(work_item)
-    return unique_work_items(work_items)
-
-
 def xml_section_title_candidate_text(element) -> str:
     if element.tag == W_P:
         return xml_element_text(element)
@@ -1199,32 +1000,46 @@ def xml_detect_section_work_item(
     normalized_work_items: list[tuple[str, str]],
 ) -> str | None:
     detected_work_item = xml_detect_any_section_work_item(element)
-    if detected_work_item:
-        normalized_title = canonical_work_item_name(detected_work_item)
-        matched_work_items = [
-            work_item
-            for work_item, normalized_work_item in normalized_work_items
-            if normalized_section_work_item_matches_title(
-                normalized_title,
-                normalized_work_item,
-            )
-        ]
-        if matched_work_items:
-            return max(matched_work_items, key=len)
+    if not detected_work_item:
+        return None
 
-    leading_match = work_item_from_near_start_text(
-        xml_leading_block_text(element),
-        normalized_work_items,
-    )
-    if leading_match:
-        return leading_match
+    normalized_title = canonical_work_item_name(detected_work_item)
+    matched_work_items = [
+        work_item
+        for work_item, normalized_work_item in normalized_work_items
+        if normalized_section_work_item_matches_title(
+            normalized_title,
+            normalized_work_item,
+        )
+    ]
+    if matched_work_items:
+        return max(matched_work_items, key=len)
 
     return None
 
 
 def xml_detect_any_section_work_item(element) -> str | None:
-    work_items = xml_section_title_work_items(element)
-    return work_items[0] if work_items else None
+    text = xml_section_title_candidate_text(element)
+    if not text:
+        return None
+
+    if element.tag == W_P and is_toc_candidate(text, xml_paragraph_style(element)):
+        return None
+
+    cleaned_text = clean_toc_text(text)
+    if len(cleaned_text) > 160:
+        return None
+
+    has_title_suffix = any(suffix in cleaned_text for suffix in TOC_WORK_ITEM_SUFFIXES)
+    style_name = xml_paragraph_style(element)
+    has_title_style = style_name.startswith("Heading") or style_name.startswith("標題")
+
+    if element.tag == W_TBL and not has_title_suffix:
+        return None
+    if not (has_title_suffix or has_title_style):
+        return None
+
+    return to_work_item_name(cleaned_text)
 
 
 def xml_set_cell_text_preserving_first_run(cell, text: str) -> None:
@@ -1285,23 +1100,16 @@ def xml_cell_is_empty_or_old_appendix_code(cell) -> bool:
 
 def xml_cell_is_appendix_code_label(cell) -> bool:
     text = normalize_match_text(xml_element_text(cell))
-    return text in APPENDIX_CODE_LABEL_TEXTS
-
-
-def xml_appendix_code_label_text(cell, code_text: str) -> str:
-    original_text = xml_element_text(cell).strip()
-    if not original_text:
-        return code_text
-
-    new_text = re.sub(
-        r"([^\r\n]*?編\s*號)\s*[：:]+\s*(?:[A-Za-z]?\d{1,3}\s*)*$",
-        rf"\g<1>：{code_text}",
-        original_text,
-    )
-    if new_text != original_text:
-        return new_text
-
-    return f"{original_text}：{code_text}"
+    return text in {
+        "編號",
+        "表單編號",
+        "抽查編號",
+        "查驗編號",
+        "檢驗編號",
+        "紀錄編號",
+        "記錄編號",
+        "文件編號",
+    }
 
 
 def xml_replace_code_text_inside_cell(cell, code_text: str) -> bool:
@@ -1310,20 +1118,26 @@ def xml_replace_code_text_inside_cell(cell, code_text: str) -> bool:
         return False
 
     compact_text = normalize_match_text(original_text)
-    if compact_text in APPENDIX_CODE_LABEL_TEXTS:
+    if compact_text in {"編號", "表單編號", "抽查編號", "查驗編號", "檢驗編號", "紀錄編號", "記錄編號", "文件編號"}:
         return False
 
-    new_text = re.sub(
-        r"([^\r\n]*?編\s*號)\s*[：:]+\s*(?:[A-Za-z]?\d{1,3}\s*)*",
-        rf"\g<1>：{code_text}",
-        original_text,
-        count=1,
-    )
-    if new_text == original_text:
-        return False
+    replaced = False
+    for text_node in cell.xpath(".//w:t", namespaces=WORD_NAMESPACES):
+        if not text_node.text or "編號" not in text_node.text:
+            continue
 
-    xml_set_cell_text_and_font(cell, new_text)
-    return True
+        new_text = re.sub(
+            r"(編\s*號\s*[：:]\s*)([A-Za-z]?\d{0,3})?",
+            rf"\g<1>{code_text}",
+            text_node.text,
+        )
+        if new_text != text_node.text:
+            text_node.text = new_text
+            replaced = True
+
+    if replaced:
+        xml_apply_font_to_cell(cell, "標楷體")
+    return replaced
 
 
 def xml_fill_appendix_code_in_record_table(
@@ -1362,10 +1176,7 @@ def xml_fill_appendix_code_in_record_table(
                         changed = True
                         label_adjacent_filled = True
                 else:
-                    xml_set_cell_text_and_font(
-                        cell,
-                        xml_appendix_code_label_text(cell, code_text),
-                    )
+                    xml_set_cell_text_and_font(cell, f"{xml_element_text(cell)}：{code_text}")
                     changed = True
                     label_adjacent_filled = True
             elif xml_replace_code_text_inside_cell(cell, code_text):
@@ -1565,21 +1376,6 @@ def toc_entry_text_with_display_work_item(
     return cleaned_entry.replace(actual_work_item, display_work_item, 1)
 
 
-def toc_entry_text_from_template(
-    source_entry_texts: list[str],
-    display_work_item: str,
-) -> str:
-    for entry_text in source_entry_texts:
-        template_work_item = to_work_item_name(strip_toc_row_noise(entry_text))
-        if template_work_item:
-            return toc_entry_text_with_display_work_item(
-                entry_text,
-                template_work_item,
-                display_work_item,
-            )
-    return display_work_item
-
-
 def xml_filter_toc_elements(
     toc_source,
     work_items: list[str],
@@ -1600,39 +1396,20 @@ def xml_filter_toc_elements(
             else work_item
         )
         allow_reused_source = not same_work_item_name(work_item, display_work_item)
-        matched_entry = None
-        for matcher in (
-            toc_entry_matches_work_item_identity,
-            lambda entry_text, selected_work_item: row_matches_work_item(
-                entry_text,
-                [selected_work_item],
-            ),
-        ):
-            for entry_index, entry_text in enumerate(source_entry_texts):
-                if entry_index in used_entry_indexes and not allow_reused_source:
-                    continue
-                if matcher(entry_text, work_item):
-                    matched_entry = (entry_index, entry_text)
-                    break
-            if matched_entry is not None:
-                break
-
-        if matched_entry is not None:
-            entry_index, entry_text = matched_entry
-            selected_entry_texts.append(
-                toc_entry_text_with_display_work_item(
-                    entry_text,
-                    work_item,
-                    display_work_item,
+        for entry_index, entry_text in enumerate(source_entry_texts):
+            if entry_index in used_entry_indexes and not allow_reused_source:
+                continue
+            if row_matches_work_item(entry_text, [work_item]):
+                selected_entry_texts.append(
+                    toc_entry_text_with_display_work_item(
+                        entry_text,
+                        work_item,
+                        display_work_item,
+                    )
                 )
-            )
-            if not allow_reused_source:
-                used_entry_indexes.add(entry_index)
-            continue
-
-        selected_entry_texts.append(
-            toc_entry_text_from_template(source_entry_texts, display_work_item)
-        )
+                if not allow_reused_source:
+                    used_entry_indexes.add(entry_index)
+                break
 
     if not selected_entry_texts:
         return []
@@ -1787,26 +1564,30 @@ def xml_replace_work_item_text(
         (actual_base.replace("鋪", "舖"), requested_base),
     ]
 
-    def replace_work_item_once(text: str) -> str:
+    # 先處理單一 w:t 文字節點內就完整出現的情況
+    for text_node in element.xpath(".//w:t", namespaces=WORD_NAMESPACES):
+        if not text_node.text:
+            continue
+
+        new_text = text_node.text
         for old_text, new_value in replace_pairs:
-            if old_text and old_text in text:
-                return text.replace(old_text, new_value)
-        return text
+            if old_text and old_text in new_text:
+                new_text = new_text.replace(old_text, new_value)
 
-    # 以段落合併文字處理，避免 Word 拆成不同 run 時漏換；
-    # 每段只套用第一個命中的規則，避免「瀝青」被重複前綴。
-    paragraphs = []
-    if element.tag == W_P:
-        paragraphs.append(element)
-    paragraphs.extend(element.xpath(".//w:p", namespaces=WORD_NAMESPACES))
+        text_node.text = new_text
 
-    for paragraph in paragraphs:
+    # 再處理 Word 把「混凝土」「鋪面工程」拆成不同 run 的情況
+    for paragraph in element.xpath(".//w:p", namespaces=WORD_NAMESPACES):
         text_nodes = paragraph.xpath(".//w:t", namespaces=WORD_NAMESPACES)
         if not text_nodes:
             continue
 
         combined_text = "".join(node.text or "" for node in text_nodes)
-        new_combined_text = replace_work_item_once(combined_text)
+        new_combined_text = combined_text
+
+        for old_text, new_value in replace_pairs:
+            if old_text and old_text in new_combined_text:
+                new_combined_text = new_combined_text.replace(old_text, new_value)
 
         if new_combined_text != combined_text:
             text_nodes[0].text = new_combined_text
@@ -1814,14 +1595,6 @@ def xml_replace_work_item_text(
                 node.text = ""
 
     return etree.tostring(element)
-
-def appendix_toc_name_header(appendix_number: int) -> str:
-    if appendix_number in (2, 5):
-        return "抽查紀錄表名稱"
-    if appendix_number in (3, 6):
-        return "抽查管理標準表名稱"
-    return "抽查程序流程圖名稱"
-
 
 def xml_generated_toc_table(
     entry_texts: list[str],
@@ -1846,7 +1619,7 @@ def xml_generated_toc_table(
     widths = [1200, 6100, 1700]
     table.append(
         xml_toc_row(
-            ["序號", appendix_toc_name_header(appendix_number), "頁碼"],
+            ["序號", "抽查程序流程圖名稱", "頁碼"],
             widths,
             bold=True,
             shaded=True,
@@ -2087,15 +1860,12 @@ def assign_chunk_work_items(
 ) -> list[dict]:
     assigned_chunks = []
     toc_index = 0
-    substantive_chunks = [
-        chunk
-        for chunk in chunks
-        if xml_chunk_has_substantive_content(chunk.get("elements", []))
-    ]
 
-    for chunk in substantive_chunks:
+    for chunk in chunks:
+        if not xml_chunk_has_substantive_content(chunk.get("elements", [])):
+            continue
+
         work_item = chunk.get("work_item")
-        assignment_source = chunk.get("assignment_source")
         if work_item:
             for index in range(toc_index, len(toc_work_items)):
                 if same_work_item_name(toc_work_items[index], work_item):
@@ -2106,7 +1876,6 @@ def assign_chunk_work_items(
                 work_item = toc_work_items[toc_index]
                 toc_index += 1
                 if work_item:
-                    assignment_source = "toc_order"
                     break
 
         if not work_item:
@@ -2114,7 +1883,6 @@ def assign_chunk_work_items(
 
         assigned_chunk = dict(chunk)
         assigned_chunk["work_item"] = work_item
-        assigned_chunk["assignment_source"] = assignment_source or "detected"
         assigned_chunks.append(assigned_chunk)
 
     return assigned_chunks
@@ -2174,18 +1942,12 @@ def build_appendix_index_from_docx_bytes(
         if current_chunk is None:
             if not xml_has_visible_content(element):
                 continue
-            current_chunk = {
-                "work_item": detected_work_item,
-                "assignment_source": "detected" if detected_work_item else None,
-                "elements": [],
-            }
+            current_chunk = {"work_item": detected_work_item, "elements": []}
 
         current_chunk["elements"].append(etree.tostring(element))
 
         if current_chunk["work_item"] is None:
             current_chunk["work_item"] = detected_work_item
-            if detected_work_item:
-                current_chunk["assignment_source"] = "detected"
 
         if xml_has_section_break(element):
             if xml_chunk_has_visible_content(current_chunk["elements"]):
@@ -2203,191 +1965,12 @@ def build_appendix_index_from_docx_bytes(
 def section_with_requested_work_item(
     section: dict,
     requested_work_item: str,
+    is_fallback: bool = False,
 ) -> dict:
     selected_section = dict(section)
     selected_section["requested_work_item"] = requested_work_item
+    selected_section["is_fallback_section"] = is_fallback
     return selected_section
-
-
-def section_title_work_items(section: dict) -> list[str]:
-    work_items = []
-    for element_xml in section.get("elements", []):
-        try:
-            element = etree.fromstring(element_xml)
-        except Exception:
-            continue
-        work_items.extend(xml_section_title_work_items(element))
-    return unique_work_items(work_items)
-
-
-def section_has_matching_title(section: dict, work_item: str) -> bool:
-    return any(
-        same_work_item_name(title_work_item, work_item)
-        for title_work_item in section_title_work_items(section)
-    )
-
-
-def section_has_conflicting_title(section: dict, work_item: str) -> bool:
-    title_work_items = []
-    for element_xml in section.get("elements", []):
-        try:
-            element = etree.fromstring(element_xml)
-        except Exception:
-            continue
-        if element.tag != W_P:
-            continue
-        title_work_items.extend(xml_section_title_work_items(element))
-    title_work_items = unique_work_items(title_work_items)
-    if not title_work_items:
-        return False
-    return not any(
-        same_work_item_name(title_work_item, work_item)
-        for title_work_item in title_work_items
-    )
-
-
-def element_title_work_items(element_xml: bytes) -> list[str]:
-    try:
-        element = etree.fromstring(element_xml)
-    except Exception:
-        return []
-    return xml_section_title_work_items(element)
-
-
-def element_title_matches_work_item(element_xml: bytes, work_item: str) -> bool:
-    return any(
-        same_work_item_name(title_work_item, work_item)
-        for title_work_item in element_title_work_items(element_xml)
-    )
-
-
-def element_title_conflicts_with_work_item(element_xml: bytes, work_item: str) -> bool:
-    try:
-        element = etree.fromstring(element_xml)
-    except Exception:
-        return False
-    if element.tag != W_P:
-        return False
-
-    title_work_items = element_title_work_items(element_xml)
-    if not title_work_items:
-        return False
-    return not any(
-        same_work_item_name(title_work_item, work_item)
-        for title_work_item in title_work_items
-    )
-
-
-def xml_remove_page_breaks(element_xml: bytes) -> bytes:
-    try:
-        element = etree.fromstring(element_xml)
-    except Exception:
-        return element_xml
-
-    changed = False
-    for page_break in element.xpath(".//w:br[@w:type='page']", namespaces=WORD_NAMESPACES):
-        parent = page_break.getparent()
-        if parent is not None:
-            parent.remove(page_break)
-            changed = True
-
-    return etree.tostring(element) if changed else element_xml
-
-
-def xml_element_has_visible_content(element_xml: bytes) -> bool:
-    try:
-        element = etree.fromstring(element_xml)
-    except Exception:
-        return False
-    return xml_has_visible_content(element)
-
-
-def title_work_items_match_work_item(title_work_items: list[str], work_item: str) -> bool:
-    return any(
-        same_work_item_name(title_work_item, work_item)
-        for title_work_item in title_work_items
-    )
-
-
-def xml_table_slice_for_work_item(element_xml: bytes, work_item: str) -> bytes:
-    try:
-        element = etree.fromstring(element_xml)
-    except Exception:
-        return element_xml
-
-    if element.tag != W_TBL:
-        return element_xml
-
-    rows = element.xpath("./w:tr", namespaces=WORD_NAMESPACES)
-    title_rows = [
-        (row_index, xml_section_title_work_items(row))
-        for row_index, row in enumerate(rows)
-    ]
-    title_rows = [(row_index, titles) for row_index, titles in title_rows if titles]
-    if not title_rows:
-        return element_xml
-
-    matching_title_rows = [
-        (row_index, titles)
-        for row_index, titles in title_rows
-        if title_work_items_match_work_item(titles, work_item)
-    ]
-    if not matching_title_rows:
-        return element_xml
-
-    has_other_work_item = any(
-        not title_work_items_match_work_item(titles, work_item)
-        for _, titles in title_rows
-    )
-    if not has_other_work_item:
-        return element_xml
-
-    start_row_index = matching_title_rows[0][0]
-    end_row_index = len(rows)
-    for row_index, titles in title_rows:
-        if row_index <= start_row_index:
-            continue
-        if not title_work_items_match_work_item(titles, work_item):
-            end_row_index = row_index
-            break
-
-    sliced_element = copy.deepcopy(element)
-    sliced_rows = sliced_element.xpath("./w:tr", namespaces=WORD_NAMESPACES)
-    for row_index in range(len(sliced_rows) - 1, -1, -1):
-        if row_index < start_row_index or row_index >= end_row_index:
-            sliced_rows[row_index].getparent().remove(sliced_rows[row_index])
-
-    return etree.tostring(sliced_element)
-
-
-def selected_section_element_xmls(section: dict) -> list[bytes]:
-    requested_work_item = section.get("requested_work_item", section["work_item"])
-    source_elements = list(section.get("elements", []))
-    start_index = 0
-
-    for element_index, element_xml in enumerate(source_elements):
-        if element_title_matches_work_item(element_xml, requested_work_item):
-            start_index = element_index
-            break
-
-    selected_elements = []
-    for element_index, element_xml in enumerate(source_elements[start_index:]):
-        if (
-            element_index > 0
-            and element_title_conflicts_with_work_item(element_xml, requested_work_item)
-        ):
-            break
-        selected_elements.append(
-            xml_table_slice_for_work_item(element_xml, requested_work_item)
-        )
-
-    while selected_elements and not xml_element_has_visible_content(selected_elements[-1]):
-        selected_elements.pop()
-
-    if selected_elements:
-        selected_elements[0] = xml_remove_page_breaks(selected_elements[0])
-
-    return selected_elements
 
 
 def select_indexed_sections(
@@ -2400,50 +1983,37 @@ def select_indexed_sections(
     sections = index_data.get("sections", [])
     for work_item in work_items:
         matched_index = None
-
-        matched_by_title = False
-        for section_index, section in enumerate(sections):
-            if section_has_matching_title(section, work_item):
-                matched_index = section_index
-                matched_by_title = True
-                break
-
-        if appendix_number in (2, 4, 5, 6) and not matched_by_title:
-            continue
+        matched_by_fallback = False
 
         for section_index, section in enumerate(sections):
-            if matched_index is not None:
-                break
             if section_index in used_section_indexes:
                 continue
-            if section_has_conflicting_title(section, work_item):
-                continue
-            if same_work_item_identity(section["work_item"], work_item):
+            if same_work_item_name(section["work_item"], work_item):
                 matched_index = section_index
                 break
 
-        if matched_index is None:
-            for section_index, section in enumerate(sections):
-                if section_index in used_section_indexes:
-                    continue
-                if section_has_conflicting_title(section, work_item):
-                    continue
-                if same_work_item_name(section["work_item"], work_item):
-                    matched_index = section_index
+        if matched_index is None and appendix_number in (4, 5, 6):
+            for fallback_work_item in pavement_fallback_work_items(work_item):
+                for section_index, section in enumerate(sections):
+                    if same_work_item_name(section["work_item"], fallback_work_item):
+                        matched_index = section_index
+                        matched_by_fallback = True
+                        break
+                if matched_index is not None:
                     break
 
         if matched_index is None:
             continue
 
-        selected_section = section_with_requested_work_item(
-            sections[matched_index],
-            work_item,
+        selected_sections.append(
+            section_with_requested_work_item(
+                sections[matched_index],
+                work_item,
+                matched_by_fallback,
+            )
         )
-        if matched_by_title:
-            selected_section["work_item"] = work_item
-        else:
+        if not matched_by_fallback:
             used_section_indexes.add(matched_index)
-        selected_sections.append(selected_section)
     return selected_sections
 
 
@@ -2641,16 +2211,6 @@ def word_apply_toc_page_ranges(
             continue
 
 
-def word_update_header_footer_fields(document) -> None:
-    try:
-        for section in document.Sections:
-            for footer_index in (1, 2, 3):
-                section.Footers(footer_index).Range.Fields.Update()
-                section.Headers(footer_index).Range.Fields.Update()
-    except Exception:
-        pass
-
-
 def refresh_docx_fields_with_word(
     docx_bytes: bytes,
     appendix_number: int | None = None,
@@ -2661,38 +2221,99 @@ def refresh_docx_fields_with_word(
     When toc_page_range_bookmarks is provided, the generated TOC page column is
     rewritten to a static range, for example: 附錄 2-6、附錄 2-7.
     """
-    service_url = get_secret_setting("WORD_REFRESH_SERVICE_URL")
-    service_token = get_secret_setting("WORD_REFRESH_SERVICE_TOKEN")
-
-    timeout_seconds = 300
     try:
-        timeout_seconds = int(
-            os.environ.get(
-                "WORD_REFRESH_SERVICE_TIMEOUT_SECONDS",
-                st.secrets.get("WORD_REFRESH_SERVICE_TIMEOUT_SECONDS", 300),
-            )
-        )
+        import pythoncom
+        import win32com.client
     except Exception:
-        timeout_seconds = 300
+        return docx_bytes
 
-    if service_url:
-        refreshed_bytes = refresh_docx_fields_via_service(
-            docx_bytes,
-            service_url,
-            appendix_number,
-            toc_page_range_bookmarks,
-            service_token,
-            timeout_seconds,
-        )
-        if refreshed_bytes is not None:
-            return refreshed_bytes
+    with WORD_COM_LOCK:
+        pythoncom.CoInitialize()
+        word = None
+        document = None
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                input_path = Path(temp_dir) / "input.docx"
+                output_path = Path(temp_dir) / "output.docx"
+                input_path.write_bytes(docx_bytes)
 
-    return refresh_docx_fields_with_local_word(
-        docx_bytes,
-        appendix_number,
-        toc_page_range_bookmarks,
-        WORD_COM_LOCK,
-    )
+                word = win32com.client.DispatchEx("Word.Application")
+                word.Visible = False
+                word.DisplayAlerts = 0
+                try:
+                    word.AutomationSecurity = 3
+                except Exception:
+                    pass
+
+                document = word.Documents.Open(
+                    str(input_path),
+                    ConfirmConversions=False,
+                    ReadOnly=False,
+                    AddToRecentFiles=False,
+                    Visible=False,
+                    OpenAndRepair=False,
+                )
+                try:
+                    document.Repaginate()
+                except Exception:
+                    pass
+
+                try:
+                    document.Fields.Update()
+                except Exception:
+                    pass
+
+                try:
+                    for story_range in document.StoryRanges:
+                        current_range = story_range
+                        while current_range is not None:
+                            current_range.Fields.Update()
+                            current_range = current_range.NextStoryRange
+                except Exception:
+                    pass
+
+                try:
+                    for section in document.Sections:
+                        for footer_index in (1, 2, 3):
+                            section.Footers(footer_index).Range.Fields.Update()
+                            section.Headers(footer_index).Range.Fields.Update()
+                except Exception:
+                    pass
+
+                try:
+                    document.Repaginate()
+                except Exception:
+                    pass
+
+                if appendix_number is not None and toc_page_range_bookmarks:
+                    word_apply_toc_page_ranges(
+                        document,
+                        appendix_number,
+                        toc_page_range_bookmarks,
+                    )
+                    try:
+                        document.Repaginate()
+                    except Exception:
+                        pass
+
+                document.SaveAs2(str(output_path), FileFormat=16)
+                document.Close(False)
+                document = None
+                return output_path.read_bytes()
+        except Exception:
+            return docx_bytes
+        finally:
+            if document is not None:
+                try:
+                    document.Close(False)
+                except Exception:
+                    pass
+            if word is not None:
+                try:
+                    word.Quit()
+                except Exception:
+                    pass
+            pythoncom.CoUninitialize()
 
 
 def replace_document_body_with_xml(
@@ -2766,11 +2387,7 @@ def build_appendix_docx_fast(
 ) -> tuple[bytes, int, list[str]]:
     index_data = prepared_upload.get("index") or {"toc_source": None, "sections": []}
     appendix_number = int(prepared_upload.get("position", 0)) + 1
-    selected_sections = select_indexed_sections(
-        index_data,
-        work_items,
-        appendix_number,
-    )
+    selected_sections = select_indexed_sections(index_data, work_items, appendix_number)
     missing_work_items = [
         work_item
         for work_item in work_items
@@ -2782,10 +2399,7 @@ def build_appendix_docx_fast(
             for section in selected_sections
         )
     ]
-    toc_work_items = [
-        section.get("requested_work_item", section["work_item"])
-        for section in selected_sections
-    ]
+    toc_work_items = [section["work_item"] for section in selected_sections]
     toc_display_work_items = [
         section.get("requested_work_item", section["work_item"])
         for section in selected_sections
@@ -2820,7 +2434,7 @@ def build_appendix_docx_fast(
     for section_index, section in enumerate(selected_sections):
         section_elements = []
         requested_work_item = section.get("requested_work_item", section["work_item"])
-        for element_xml in selected_section_element_xmls(section):
+        for element_xml in section["elements"]:
             element_xml = xml_replace_work_item_text(
                 element_xml,
                 section["work_item"],
@@ -3104,7 +2718,6 @@ def build_appendix_docx(
 
 
 st.set_page_config(page_title="監造附錄六合一產出系統", layout="wide")
-require_app_password()
 render_page_header()
 
 upload_column, work_item_column = st.columns([1, 2.2], gap="large")
@@ -3125,11 +2738,10 @@ with upload_column:
 
         with st.container(border=True):
             st.markdown("#### 檔案對應")
-            for payload in uploaded_file_payloads(uploaded_files):
-                st.write(f"{APPENDIX_NAMES[payload['position']]}：{payload['name']}")
+            for index, uploaded_file in enumerate(uploaded_files[: len(APPENDIX_NAMES)]):
+                st.write(f"{APPENDIX_NAMES[index]}：{uploaded_file.name}")
 
 uploaded_payloads = uploaded_file_payloads(uploaded_files)
-toc_source_position = toc_source_position_from_payloads(uploaded_payloads)
 current_upload_signature = (
     PREPARE_CACHE_VERSION,
     uploaded_payloads_signature(uploaded_payloads),
@@ -3168,7 +2780,7 @@ elif st.session_state.get("prepared_upload_signature") != current_upload_signatu
             prepared_results = [
                 prepare_word_payload(
                     payload,
-                    read_toc=(payload["position"] == toc_source_position),
+                    read_toc=(payload["position"] == 0),
                 )
             ]
         else:
@@ -3179,7 +2791,7 @@ elif st.session_state.get("prepared_upload_signature") != current_upload_signatu
                     executor.map(
                         lambda payload: prepare_word_payload(
                             payload,
-                            read_toc=(payload["position"] == toc_source_position),
+                            read_toc=(payload["position"] == 0),
                         ),
                         missing_payloads,
                     )
@@ -3199,9 +2811,8 @@ elif st.session_state.get("prepared_upload_signature") != current_upload_signatu
         for index in sorted(prepared_by_position)
     ]
 
-    toc_source_upload = prepared_by_position.get(toc_source_position)
-    if toc_source_upload:
-        toc_work_items_for_uploads = list(toc_source_upload["work_items"])
+    if prepared_uploads:
+        toc_work_items_for_uploads = list(prepared_uploads[0]["work_items"])
 
     for prepared_upload in prepared_uploads:
         if prepared_upload["docx_bytes"] is None and prepared_upload["error"]:
@@ -3226,11 +2837,14 @@ with work_item_column:
     )
     st.subheader("工項選擇表單")
 
-    selectable_work_items = [
-        work_item
-        for work_item in toc_work_items
-        if not is_default_work_item_option(work_item)
-    ]
+    selectable_work_items = sorted(
+        [
+            work_item
+            for work_item in toc_work_items
+            if not is_default_work_item(work_item)
+        ],
+        key=work_item_sort_key,
+    )
 
     selectable_work_item_labels = {
         work_item: f"{index:02d}. {work_item}"
@@ -3249,6 +2863,7 @@ with work_item_column:
     if selectable_work_items:
         st.caption(
             f"已從 Word 目錄抓到 {len(selectable_work_items)} 個可選工項"
+            "（已排除放樣、開挖、回填、便道）"
         )
 
         if st.button("新增工項欄位"):
@@ -3276,7 +2891,6 @@ with work_item_column:
                         format_func=lambda item: selectable_work_item_labels.get(item, item),
                         index=None,
                         placeholder="請選擇工項",
-                        filter_mode="contains",
                         key=select_key,
                     )
 
@@ -3299,7 +2913,7 @@ with work_item_column:
     else:
         selected_work_items = []
         if toc_work_items:
-            st.info("請從目錄工項選單選擇要納入產出的工項。")
+            st.info("Word 目錄目前只抓到預設工項，已自動納入產出，不需另外選擇。")
         else:
             st.info("請先匯入 Word 檔案，系統會自動抓取目錄內容產生工項選單。")
 
@@ -3313,10 +2927,8 @@ current_output_signature = (
     tuple(output_work_items),
     project_name.strip(),
 )
-outputs_are_current = (
-    st.session_state.get("outputs_signature") == current_output_signature
-    and bool(st.session_state.get("outputs"))
-)
+if st.session_state.get("outputs_signature") != current_output_signature:
+    st.session_state.pop("outputs", None)
 
 _, action_column = st.columns([1, 2.2], gap="large")
 with action_column:
@@ -3325,12 +2937,8 @@ with action_column:
         complete_clicked = st.button("完成", type="primary", use_container_width=True)
 
 if complete_clicked:
-    if outputs_are_current:
-        st.success("已沿用上次產出結果，可直接下載。")
-    elif len(uploaded_files) != len(APPENDIX_NAMES):
+    if len(uploaded_files) != len(APPENDIX_NAMES):
         st.error("請先一次上傳 6 個 Word 檔案。")
-    elif not output_work_items:
-        st.error("請至少選擇一個要產出的工項。")
     elif any(upload["docx_bytes"] is None for upload in prepared_uploads):
         st.error("有檔案無法讀取或轉換，請確認 Word 檔案格式後重新上傳。")
         failed_uploads = [
@@ -3528,18 +3136,7 @@ if complete_clicked:
             st.success("處理完成，請分別下載 6 個 Word 檔案。")
 
 if "outputs" in st.session_state:
-    outputs_match_current = (
-        st.session_state.get("outputs_signature") == current_output_signature
-    )
-    output_title = "輸出下載" if outputs_match_current else "上次輸出下載"
-    title_column, clear_column = st.columns([4, 1])
-    with title_column:
-        st.subheader(output_title)
-    with clear_column:
-        if st.button("清除輸出", key="clear_outputs", use_container_width=True):
-            st.session_state.pop("outputs", None)
-            st.session_state.pop("outputs_signature", None)
-            st.rerun()
+    st.subheader("輸出下載")
     download_rows = [st.columns(3), st.columns(3)]
     for index, output in enumerate(st.session_state["outputs"]):
         column = download_rows[index // 3][index % 3]
@@ -3550,5 +3147,4 @@ if "outputs" in st.session_state:
                 file_name=output["file_name"],
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 key=f"download_{index + 1}",
-                on_click="ignore",
             )
