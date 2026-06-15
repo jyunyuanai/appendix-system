@@ -1,16 +1,39 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import tempfile
+import zipfile
 from contextlib import nullcontext
 from pathlib import Path
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
+from lxml import etree
+
+
+WORD_NAMESPACE = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+WORD_NAMESPACES = {"w": WORD_NAMESPACE}
+
 
 WD_ACTIVE_END_ADJUSTED_PAGE_NUMBER = 1
 WD_ACTIVE_END_PAGE_NUMBER = 3
+
+
+def word_previous_character_range(range_object):
+    try:
+        duplicate_range = range_object.Duplicate
+        if callable(duplicate_range):
+            duplicate_range = duplicate_range()
+        start_position = int(duplicate_range.Start)
+        if start_position <= 0:
+            return None
+        duplicate_range.Start = start_position - 1
+        duplicate_range.End = start_position
+        return duplicate_range
+    except Exception:
+        return None
 
 
 def word_range_information_number(range_object, information_type: int) -> int | None:
@@ -28,11 +51,25 @@ def word_range_information_number(range_object, information_type: int) -> int | 
         return None
 
 
-def word_bookmark_adjusted_page_number(document, bookmark_name: str) -> int | None:
+def word_bookmark_adjusted_page_number(
+    document,
+    bookmark_name: str,
+    prefer_previous_character: bool = False,
+) -> int | None:
     try:
         bookmark_range = document.Bookmarks(bookmark_name).Range
     except Exception:
         return None
+
+    if prefer_previous_character:
+        previous_range = word_previous_character_range(bookmark_range)
+        if previous_range is not None:
+            previous_page_number = word_range_information_number(
+                previous_range,
+                WD_ACTIVE_END_ADJUSTED_PAGE_NUMBER,
+            )
+            if previous_page_number is not None:
+                return previous_page_number
 
     adjusted_page_number = word_range_information_number(
         bookmark_range,
@@ -61,6 +98,36 @@ def word_update_document_fields(document) -> None:
         pass
 
 
+def disable_docx_update_fields(docx_bytes: bytes) -> bytes:
+    input_stream = io.BytesIO(docx_bytes)
+    output_stream = io.BytesIO()
+
+    try:
+        with zipfile.ZipFile(input_stream, "r") as source_zip:
+            with zipfile.ZipFile(output_stream, "w") as output_zip:
+                for item in source_zip.infolist():
+                    data = source_zip.read(item.filename)
+                    if item.filename == "word/settings.xml":
+                        root = etree.fromstring(data)
+                        update_fields = root.find(
+                            "./w:updateFields",
+                            namespaces=WORD_NAMESPACES,
+                        )
+                        if update_fields is not None:
+                            update_fields.set(f"{{{WORD_NAMESPACE}}}val", "false")
+                            data = etree.tostring(
+                                root,
+                                xml_declaration=True,
+                                encoding="UTF-8",
+                                standalone=True,
+                            )
+                    output_zip.writestr(item, data)
+    except Exception:
+        return docx_bytes
+
+    return output_stream.getvalue()
+
+
 def word_find_generated_toc_table(document):
     try:
         for table in document.Tables:
@@ -74,26 +141,39 @@ def word_find_generated_toc_table(document):
     return None
 
 
-def word_set_toc_cell_text(cell, text: str) -> None:
+def word_cell_visible_text(cell) -> str:
+    try:
+        return cell.Range.Text.replace("\r", "").replace("\x07", "").strip()
+    except Exception:
+        return ""
+
+
+def word_set_toc_cell_text(cell, text: str, force: bool = False) -> bool:
+    if not force and word_cell_visible_text(cell) == text:
+        return False
+
     range_object = cell.Range
     range_object.End -= 1
     range_object.Text = text
+    return True
 
 
 def word_apply_toc_page_ranges(
     document,
     appendix_number: int,
     toc_page_range_bookmarks: list[tuple[str, str]],
-) -> None:
+    force: bool = False,
+) -> bool:
     toc_table = word_find_generated_toc_table(document)
     if toc_table is None:
-        return
+        return False
 
     try:
         row_count = toc_table.Rows.Count
     except Exception:
-        return
+        return False
 
+    changed = False
     for pair_index, (start_bookmark_name, end_bookmark_name) in enumerate(
         toc_page_range_bookmarks,
         start=2,
@@ -102,7 +182,11 @@ def word_apply_toc_page_ranges(
             break
 
         start_page = word_bookmark_adjusted_page_number(document, start_bookmark_name)
-        end_page = word_bookmark_adjusted_page_number(document, end_bookmark_name)
+        end_page = word_bookmark_adjusted_page_number(
+            document,
+            end_bookmark_name,
+            prefer_previous_character=True,
+        )
         if start_page is None and end_page is None:
             continue
         if start_page is None:
@@ -111,14 +195,53 @@ def word_apply_toc_page_ranges(
             end_page = start_page
 
         if start_page == end_page:
-            page_text = f"附錄 {appendix_number}-{start_page}"
+            page_text = f"附錄{appendix_number}-{start_page}"
         else:
-            page_text = f"附錄 {appendix_number}-{start_page}、附錄 {appendix_number}-{end_page}"
+            page_text = f"附錄{appendix_number}-{start_page}、附錄{appendix_number}-{end_page}"
 
         try:
-            word_set_toc_cell_text(toc_table.Cell(pair_index, 3), page_text)
+            if word_set_toc_cell_text(toc_table.Cell(pair_index, 3), page_text, force=force):
+                changed = True
         except Exception:
             continue
+
+    return changed
+
+
+def word_repaginate(document) -> None:
+    try:
+        document.Repaginate()
+    except Exception:
+        pass
+
+
+def word_apply_toc_page_ranges_until_stable(
+    document,
+    appendix_number: int,
+    toc_page_range_bookmarks: list[tuple[str, str]],
+    max_passes: int = 4,
+) -> None:
+    for _ in range(max(1, max_passes)):
+        changed = word_apply_toc_page_ranges(
+            document,
+            appendix_number,
+            toc_page_range_bookmarks,
+        )
+        word_repaginate(document)
+        if not changed:
+            break
+
+    # Convert every TOC page-number cell to static text, even when its value
+    # already matches the cached field result. Otherwise single-page rows are
+    # left with a live PAGEREF field whose result can drift (e.g. collapse to
+    # an unrelated page) if the user's Word later recalculates fields.
+    word_apply_toc_page_ranges(
+        document,
+        appendix_number,
+        toc_page_range_bookmarks,
+        force=True,
+    )
+    word_repaginate(document)
 
 
 def word_update_header_footer_fields(document) -> None:
@@ -175,33 +298,23 @@ def refresh_docx_fields_with_local_word(
                     Visible=False,
                     OpenAndRepair=False,
                 )
-                try:
-                    document.Repaginate()
-                except Exception:
-                    pass
+                word_repaginate(document)
                 word_update_document_fields(document)
-                try:
-                    document.Repaginate()
-                except Exception:
-                    pass
+                word_repaginate(document)
 
                 if appendix_number is not None and toc_page_range_bookmarks:
-                    word_apply_toc_page_ranges(
+                    word_apply_toc_page_ranges_until_stable(
                         document,
                         appendix_number,
                         toc_page_range_bookmarks,
                     )
-                    try:
-                        document.Repaginate()
-                    except Exception:
-                        pass
 
                 word_update_header_footer_fields(document)
 
                 document.SaveAs2(str(output_path), FileFormat=16)
                 document.Close(False)
                 document = None
-                return output_path.read_bytes()
+                return disable_docx_update_fields(output_path.read_bytes())
         except Exception:
             return docx_bytes
         finally:

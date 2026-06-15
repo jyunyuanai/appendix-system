@@ -25,7 +25,7 @@ APP_DIR = Path(__file__).resolve().parent
 APPENDIX_NAMES = ["附錄一", "附錄二", "附錄三", "附錄四", "附錄五", "附錄六"]
 DEFAULT_WORK_ITEMS = ["放樣", "開挖", "回填", "便道"]
 UI_MASCOT_IMAGE = APP_DIR / "assets" / "ui_mascots.png"
-PREPARE_CACHE_VERSION = 50
+PREPARE_CACHE_VERSION = 51
 MAX_PREPARE_WORKERS = 4
 MAX_OUTPUT_WORKERS = 6
 APPENDIX_CODE_PREFIXES = ["A", "B", "C", "D", "E", "F"]
@@ -1471,7 +1471,7 @@ def xml_toc_page_reference_cell(
     for attribute_name in ("ascii", "hAnsi", "eastAsia", "cs"):
         run_fonts.set(f"{{{WORD_NAMESPACE}}}{attribute_name}", "標楷體")
     prefix_text = etree.SubElement(prefix_run, f"{{{WORD_NAMESPACE}}}t")
-    prefix_text.text = f"附錄 {appendix_number}-"
+    prefix_text.text = f"附錄{appendix_number}-"
 
     page_field = etree.SubElement(paragraph, f"{{{WORD_NAMESPACE}}}fldSimple")
     page_field.set(f"{{{WORD_NAMESPACE}}}instr", f" PAGEREF {bookmark_name} \\h ")
@@ -1633,7 +1633,7 @@ def xml_generated_toc_table(
                 )
             )
         else:
-            row.append(xml_toc_cell(f"附錄 {appendix_number}-{index}", widths[2]))
+            row.append(xml_toc_cell(f"附錄{appendix_number}-{index}", widths[2]))
         table.append(row)
 
     return etree.tostring(table)
@@ -1686,6 +1686,33 @@ def xml_section_break_next_page_paragraph() -> bytes:
     return etree.tostring(paragraph)
 
 
+def xml_paragraph_has_visible_content(paragraph) -> bool:
+    if xml_element_text(paragraph).strip():
+        return True
+    return bool(
+        paragraph.xpath(
+            ".//w:drawing | .//w:pict | .//w:object",
+            namespaces=WORD_NAMESPACES,
+        )
+    )
+
+
+def xml_visible_or_fallback_paragraph(element, from_end: bool = False):
+    if element.tag == W_P:
+        return element
+
+    paragraphs = element.xpath(".//w:p", namespaces=WORD_NAMESPACES)
+    if not paragraphs:
+        return None
+
+    paragraph_iterable = reversed(paragraphs) if from_end else paragraphs
+    for paragraph in paragraph_iterable:
+        if xml_paragraph_has_visible_content(paragraph):
+            return paragraph
+
+    return paragraphs[-1] if from_end else paragraphs[0]
+
+
 def xml_add_bookmark_to_element(
     element_xml: bytes,
     bookmark_name: str,
@@ -1696,13 +1723,9 @@ def xml_add_bookmark_to_element(
     except Exception:
         return element_xml
 
-    if element.tag == W_P:
-        paragraph = element
-    else:
-        paragraphs = element.xpath(".//w:p", namespaces=WORD_NAMESPACES)
-        if not paragraphs:
-            return element_xml
-        paragraph = paragraphs[0]
+    paragraph = xml_visible_or_fallback_paragraph(element)
+    if paragraph is None:
+        return element_xml
 
     bookmark_start = etree.Element(f"{{{WORD_NAMESPACE}}}bookmarkStart")
     bookmark_start.set(f"{{{WORD_NAMESPACE}}}id", str(bookmark_id))
@@ -1732,13 +1755,9 @@ def xml_add_bookmark_to_element_end(
     except Exception:
         return element_xml
 
-    if element.tag == W_P:
-        paragraph = element
-    else:
-        paragraphs = element.xpath(".//w:p", namespaces=WORD_NAMESPACES)
-        if not paragraphs:
-            return element_xml
-        paragraph = paragraphs[-1]
+    paragraph = xml_visible_or_fallback_paragraph(element, from_end=True)
+    if paragraph is None:
+        return element_xml
 
     bookmark_start = etree.Element(f"{{{WORD_NAMESPACE}}}bookmarkStart")
     bookmark_start.set(f"{{{WORD_NAMESPACE}}}id", str(bookmark_id))
@@ -2261,7 +2280,7 @@ def xml_generated_appendix_footer(appendix_number: int) -> bytes:
 
     prefix_run = etree.SubElement(paragraph, f"{{{WORD_NAMESPACE}}}r")
     prefix_text = etree.SubElement(prefix_run, f"{{{WORD_NAMESPACE}}}t")
-    prefix_text.text = f"附錄 {appendix_number}-"
+    prefix_text.text = f"附錄{appendix_number}-"
 
     page_field = etree.SubElement(paragraph, f"{{{WORD_NAMESPACE}}}fldSimple")
     page_field.set(f"{{{WORD_NAMESPACE}}}instr", " PAGE \\* MERGEFORMAT ")
@@ -2360,7 +2379,7 @@ def refresh_docx_fields_with_word(
     """Use local Microsoft Word to repaginate and save PAGE/PAGEREF results.
 
     When toc_page_range_bookmarks is provided, the generated TOC page column is
-    rewritten to a static range, for example: 附錄 2-6、附錄 2-7.
+    rewritten to a static range, for example: 附錄2-6、附錄2-7.
     """
     service_url = get_secret_setting("WORD_REFRESH_SERVICE_URL")
     service_token = get_secret_setting("WORD_REFRESH_SERVICE_TOKEN")
