@@ -9,16 +9,56 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 
-def word_bookmark_adjusted_page_number(document, bookmark_name: str) -> int | None:
+WD_ACTIVE_END_ADJUSTED_PAGE_NUMBER = 1
+WD_ACTIVE_END_PAGE_NUMBER = 3
+
+
+def word_range_information_number(range_object, information_type: int) -> int | None:
     try:
-        bookmark_range = document.Bookmarks(bookmark_name).Range
-        page_number = bookmark_range.Information(3)
+        page_number = range_object.Information(information_type)
     except Exception:
         return None
 
     if not page_number:
         return None
-    return int(page_number) - 1 if int(page_number) > 1 else 1
+
+    try:
+        return max(1, int(page_number))
+    except (TypeError, ValueError):
+        return None
+
+
+def word_bookmark_adjusted_page_number(document, bookmark_name: str) -> int | None:
+    try:
+        bookmark_range = document.Bookmarks(bookmark_name).Range
+    except Exception:
+        return None
+
+    adjusted_page_number = word_range_information_number(
+        bookmark_range,
+        WD_ACTIVE_END_ADJUSTED_PAGE_NUMBER,
+    )
+    if adjusted_page_number is not None:
+        return adjusted_page_number
+
+    physical_page_number = word_range_information_number(
+        bookmark_range,
+        WD_ACTIVE_END_PAGE_NUMBER,
+    )
+    if physical_page_number is None:
+        return None
+
+    # Very old Word automation environments may not expose the adjusted page
+    # number. Keep the previous one-page TOC fallback instead of failing the
+    # refresh entirely, but prefer the adjusted value whenever Word provides it.
+    return physical_page_number - 1 if physical_page_number > 1 else 1
+
+
+def word_update_document_fields(document) -> None:
+    try:
+        document.Fields.Update()
+    except Exception:
+        pass
 
 
 def word_find_generated_toc_table(document):
@@ -73,7 +113,7 @@ def word_apply_toc_page_ranges(
         if start_page == end_page:
             page_text = f"附錄 {appendix_number}-{start_page}"
         else:
-            page_text = f"附錄 {appendix_number}-{start_page}至附錄 {appendix_number}-{end_page}"
+            page_text = f"附錄 {appendix_number}-{start_page}、附錄 {appendix_number}-{end_page}"
 
         try:
             word_set_toc_cell_text(toc_table.Cell(pair_index, 3), page_text)
@@ -135,6 +175,11 @@ def refresh_docx_fields_with_local_word(
                     Visible=False,
                     OpenAndRepair=False,
                 )
+                try:
+                    document.Repaginate()
+                except Exception:
+                    pass
+                word_update_document_fields(document)
                 try:
                     document.Repaginate()
                 except Exception:
