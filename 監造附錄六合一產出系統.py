@@ -1883,6 +1883,26 @@ def xml_chunk_has_substantive_content(elements: list[bytes]) -> bool:
     return False
 
 
+def merge_continuation_chunks(chunks: list[dict]) -> list[dict]:
+    merged: list[dict] = []
+    for chunk in chunks:
+        if not merged:
+            merged.append(chunk)
+            continue
+        prev = merged[-1]
+        prev_item = prev.get("work_item")
+        curr_item = chunk.get("work_item")
+        should_merge = prev_item is not None and (
+            curr_item is None
+            or same_work_item_name(curr_item, prev_item)
+        )
+        if should_merge:
+            prev["elements"].extend(chunk.get("elements", []))
+        else:
+            merged.append(chunk)
+    return merged
+
+
 def assign_chunk_work_items(
     chunks: list[dict],
     toc_work_items: list[str],
@@ -1997,6 +2017,7 @@ def build_appendix_index_from_docx_bytes(
     if current_chunk and xml_chunk_has_visible_content(current_chunk["elements"]):
         chunks.append(current_chunk)
 
+    chunks = merge_continuation_chunks(chunks)
     sections = assign_chunk_work_items(chunks, toc_work_items)
 
     return {"toc_source": toc_source, "sections": sections}
