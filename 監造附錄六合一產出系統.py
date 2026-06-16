@@ -502,9 +502,16 @@ def extract_work_items_from_docx_bytes(docx_bytes: bytes) -> list[str]:
     return unique_work_items(work_items)
 
 
-@st.cache_data(show_spinner=False)
+def _prune_dict(d: dict, max_entries: int) -> None:
+    """Keep at most max_entries in d by evicting oldest insertions."""
+    while len(d) > max_entries:
+        try:
+            del d[next(iter(d))]
+        except (StopIteration, KeyError):
+            break
 
 
+@st.cache_data(show_spinner=False, max_entries=20, ttl=3600)
 def normalize_doc_to_docx_bytes(file_name: str, file_bytes: bytes) -> bytes:
     suffix = Path(file_name).suffix.lower()
     if suffix == ".docx" or zipfile.is_zipfile(io.BytesIO(file_bytes)):
@@ -2146,16 +2153,33 @@ def xml_table_slice_for_work_item(
     if not matching_title_rows:
         return element_xml
 
+    # 廣義標題行偵測：對每一列要求含有 TOC 後綴（require_suffix=True），
+    # 用於判斷複合表中「非使用者選取」的工項邊界（例如石籠雖未被選取，
+    # 但其標題列仍代表一個新工項的起點，需要被識別以正確截斷切片）。
+    broad_title_rows = []
+    for row_index, row in enumerate(rows):
+        broad_titles = []
+        for text, style_name in xml_title_candidate_texts(row):
+            if not text_looks_like_section_title(text, style_name, require_suffix=True):
+                continue
+            wi = to_work_item_name(clean_toc_text(text))
+            if wi:
+                broad_titles.append(wi)
+        if broad_titles:
+            broad_title_rows.append((row_index, unique_work_items(broad_titles)))
+
+    boundary_title_rows = broad_title_rows if broad_title_rows else title_rows
+
     has_other_work_item = any(
         not title_work_items_match_work_item(titles, work_item)
-        for _, titles in title_rows
+        for _, titles in boundary_title_rows
     )
     if not has_other_work_item:
         return element_xml
 
     start_row_index = matching_title_rows[0][0]
     end_row_index = len(rows)
-    for row_index, titles in title_rows:
+    for row_index, titles in boundary_title_rows:
         if row_index <= start_row_index:
             continue
         if not title_work_items_match_work_item(titles, work_item):
@@ -2683,6 +2707,7 @@ elif st.session_state.get("prepared_upload_signature") != current_upload_signatu
                 prepared_upload["digest"],
             )
             prepare_cache[cache_key] = dict(prepared_upload)
+            _prune_dict(prepare_cache, 18)
             prepared_by_position[prepared_upload["position"]] = prepared_upload
 
     prepared_uploads = [
@@ -2894,6 +2919,7 @@ if complete_clicked:
                 for index, indexed_upload, index_key in indexed_results:
                     if indexed_upload.get("index") is not None:
                         index_cache[index_key] = indexed_upload["index"]
+                        _prune_dict(index_cache, 12)
                     indexed_uploads[index] = indexed_upload
 
             st.session_state["prepared_uploads"] = indexed_uploads
@@ -2992,6 +3018,7 @@ if complete_clicked:
                         selected_element_count,
                         missing_work_items,
                     )
+                    _prune_dict(output_cache, 12)
                     if selected_element_count == 0:
                         empty_outputs.append(APPENDIX_NAMES[index])
                     elif selected_element_count < len(output_work_items_tuple):
