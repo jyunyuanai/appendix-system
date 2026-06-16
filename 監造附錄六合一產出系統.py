@@ -25,7 +25,7 @@ APP_DIR = Path(__file__).resolve().parent
 APPENDIX_NAMES = ["附錄一", "附錄二", "附錄三", "附錄四", "附錄五", "附錄六"]
 DEFAULT_WORK_ITEMS = ["放樣", "開挖", "回填", "便道"]
 UI_MASCOT_IMAGE = APP_DIR / "assets" / "ui_mascots.png"
-PREPARE_CACHE_VERSION = 51
+PREPARE_CACHE_VERSION = 53
 MAX_PREPARE_WORKERS = 4
 MAX_OUTPUT_WORKERS = 6
 APPENDIX_CODE_PREFIXES = ["A", "B", "C", "D", "E", "F"]
@@ -2132,6 +2132,50 @@ def title_work_items_match_work_item(title_work_items: list[str], work_item: str
     )
 
 
+def xml_row_header_cell_texts(row) -> list[tuple[str, str]]:
+    """
+    只從「跨欄儲存格（gridSpan > 1）」或「列中第一個有文字的儲存格」
+    取得候選標題文字，避免內部欄位（如「依設計圖說」欄）的表單參考文字
+    （例如「材料進場抽查紀錄表」）被誤判為複合表的章節邊界，
+    導致固床工等單一工項的大型表格被不當截斷。
+    """
+    cells = row.xpath("./w:tc", namespaces=WORD_NAMESPACES)
+    if not cells:
+        return []
+
+    candidates = []
+    first_non_empty_processed = False
+
+    for cell in cells:
+        grid_span_el = cell.find("./w:tcPr/w:gridSpan", namespaces=WORD_NAMESPACES)
+        try:
+            span = (
+                int(grid_span_el.get(f"{{{WORD_NAMESPACE}}}val", "1"))
+                if grid_span_el is not None
+                else 1
+            )
+        except (ValueError, TypeError):
+            span = 1
+
+        cell_text = xml_element_text(cell).strip()
+        if not cell_text:
+            continue
+
+        is_spanning = span > 1
+        is_first = not first_non_empty_processed
+        first_non_empty_processed = True
+
+        if not (is_spanning or is_first):
+            continue
+
+        for paragraph in cell.xpath(".//w:p", namespaces=WORD_NAMESPACES):
+            text = xml_direct_text(paragraph)
+            if text:
+                candidates.append((text, xml_paragraph_style(paragraph)))
+
+    return candidates
+
+
 def xml_table_slice_for_work_item(
     element_xml: bytes,
     work_item: str,
@@ -2177,10 +2221,12 @@ def xml_table_slice_for_work_item(
     # 廣義標題行偵測：對每一列要求含有 TOC 後綴（require_suffix=True），
     # 用於判斷複合表中「非使用者選取」的工項邊界（例如石籠雖未被選取，
     # 但其標題列仍代表一個新工項的起點，需要被識別以正確截斷切片）。
+    # 使用 xml_row_header_cell_texts 只看跨欄儲存格或第一個有文字的儲存格，
+    # 避免內部欄位的表單參考文字（如「材料進場抽查紀錄表」）被誤判為邊界。
     broad_title_rows = []
     for row_index, row in enumerate(rows):
         broad_titles = []
-        for text, style_name in xml_title_candidate_texts(row):
+        for text, style_name in xml_row_header_cell_texts(row):
             if not text_looks_like_section_title(text, style_name, require_suffix=True):
                 continue
             wi = to_work_item_name(clean_toc_text(text))
@@ -2265,11 +2311,20 @@ def select_indexed_sections(
         matched_index = None
 
         matched_by_title = False
+        fallback_title_index = None
         for section_index, section in enumerate(sections):
             if section_has_matching_title(section, work_item):
-                matched_index = section_index
-                matched_by_title = True
-                break
+                # 優先選 chunk 本身 work_item 就吻合的（獨立 section），
+                # 而非合併大表裡碰巧含有該工項標題的 chunk。
+                if same_work_item_name(section.get("work_item") or "", work_item):
+                    matched_index = section_index
+                    matched_by_title = True
+                    break
+                if fallback_title_index is None:
+                    fallback_title_index = section_index
+        if not matched_by_title and fallback_title_index is not None:
+            matched_index = fallback_title_index
+            matched_by_title = True
 
         if appendix_number in (2, 4, 5, 6) and not matched_by_title:
             continue
