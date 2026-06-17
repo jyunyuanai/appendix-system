@@ -25,7 +25,7 @@ APP_DIR = Path(__file__).resolve().parent
 APPENDIX_NAMES = ["附錄一", "附錄二", "附錄三", "附錄四", "附錄五", "附錄六"]
 DEFAULT_WORK_ITEMS = ["放樣", "開挖", "回填", "便道"]
 UI_MASCOT_IMAGE = APP_DIR / "assets" / "ui_mascots.png"
-PREPARE_CACHE_VERSION = 54
+PREPARE_CACHE_VERSION = 56
 MAX_PREPARE_WORKERS = 4
 MAX_OUTPUT_WORKERS = 6
 APPENDIX_CODE_PREFIXES = ["A", "B", "C", "D", "E", "F"]
@@ -2134,45 +2134,30 @@ def title_work_items_match_work_item(title_work_items: list[str], work_item: str
 
 def xml_row_header_cell_texts(row) -> list[tuple[str, str]]:
     """
-    只從「跨欄儲存格（gridSpan > 1）」或「列中第一個有文字的儲存格」
-    取得候選標題文字，避免內部欄位（如「依設計圖說」欄）的表單參考文字
-    （例如「材料進場抽查紀錄表」）被誤判為複合表的章節邊界，
-    導致固床工等單一工項的大型表格被不當截斷。
+    只從列的「第一個儲存格（cells[0]）」取得候選標題文字。
+
+    複合表中每個工項的章節標題列，其標題必定位於該列的第一個儲存格
+    （通常是跨欄至整行寬度的儲存格）。
+    資料列的第一個儲存格永遠是「施工前/施工中/施工後」等階段文字
+    或 vMerge 連續空白，絕不含 TOC 工項後綴。
+
+    因此，列中第一個儲存格以外的所有跨欄儲存格（例如「依設計圖說」欄
+    可能以 gridSpan=3 橫跨數欄、內含「材料進場抽查紀錄表」）
+    一律排除，避免被誤判為章節邊界而截斷大型表格。
     """
     cells = row.xpath("./w:tc", namespaces=WORD_NAMESPACES)
     if not cells:
         return []
 
+    first_cell = cells[0]
+    if not xml_element_text(first_cell).strip():
+        return []
+
     candidates = []
-    first_non_empty_processed = False
-
-    for cell in cells:
-        grid_span_el = cell.find("./w:tcPr/w:gridSpan", namespaces=WORD_NAMESPACES)
-        try:
-            span = (
-                int(grid_span_el.get(f"{{{WORD_NAMESPACE}}}val", "1"))
-                if grid_span_el is not None
-                else 1
-            )
-        except (ValueError, TypeError):
-            span = 1
-
-        cell_text = xml_element_text(cell).strip()
-        if not cell_text:
-            continue
-
-        is_spanning = span > 1
-        is_first = not first_non_empty_processed
-        first_non_empty_processed = True
-
-        if not (is_spanning or is_first):
-            continue
-
-        for paragraph in cell.xpath(".//w:p", namespaces=WORD_NAMESPACES):
-            text = xml_direct_text(paragraph)
-            if text:
-                candidates.append((text, xml_paragraph_style(paragraph)))
-
+    for paragraph in first_cell.xpath(".//w:p", namespaces=WORD_NAMESPACES):
+        text = xml_direct_text(paragraph)
+        if text:
+            candidates.append((text, xml_paragraph_style(paragraph)))
     return candidates
 
 
@@ -2195,12 +2180,26 @@ def xml_table_slice_for_work_item(
     boundary_items = boundary_work_items if boundary_work_items else [work_item]
 
     rows = element.xpath("./w:tr", namespaces=WORD_NAMESPACES)
+
+    # 只從「跨欄儲存格」或「列中第一個有文字的儲存格」抽取列標題，
+    # 統一用於 title_rows 和 broad_title_rows，防止資料欄（如「依設計圖說」欄）
+    # 的表單參考文字（例如「材料進場抽查紀錄表」）被誤判為章節邊界。
+    def row_header_title_work_items(row) -> list[str]:
+        work_items = []
+        for text, style_name in xml_row_header_cell_texts(row):
+            if not text_looks_like_section_title(text, style_name, require_suffix=True):
+                continue
+            wi = to_work_item_name(clean_toc_text(text))
+            if wi:
+                work_items.append(wi)
+        return unique_work_items(work_items)
+
     title_rows = [
         (
             row_index,
             [
                 title
-                for title in xml_section_title_work_items(row)
+                for title in row_header_title_work_items(row)
                 if any(same_work_item_name(title, item) for item in boundary_items)
             ],
         )
@@ -2218,22 +2217,13 @@ def xml_table_slice_for_work_item(
     if not matching_title_rows:
         return element_xml
 
-    # 廣義標題行偵測：對每一列要求含有 TOC 後綴（require_suffix=True），
-    # 用於判斷複合表中「非使用者選取」的工項邊界（例如石籠雖未被選取，
-    # 但其標題列仍代表一個新工項的起點，需要被識別以正確截斷切片）。
-    # 使用 xml_row_header_cell_texts 只看跨欄儲存格或第一個有文字的儲存格，
-    # 避免內部欄位的表單參考文字（如「材料進場抽查紀錄表」）被誤判為邊界。
-    broad_title_rows = []
-    for row_index, row in enumerate(rows):
-        broad_titles = []
-        for text, style_name in xml_row_header_cell_texts(row):
-            if not text_looks_like_section_title(text, style_name, require_suffix=True):
-                continue
-            wi = to_work_item_name(clean_toc_text(text))
-            if wi:
-                broad_titles.append(wi)
-        if broad_titles:
-            broad_title_rows.append((row_index, unique_work_items(broad_titles)))
+    # 廣義標題行偵測：偵測複合表中「非使用者選取」工項的邊界列，
+    # 同樣只看表頭儲存格，與 title_rows 共用同一過濾邏輯。
+    broad_title_rows = [
+        (row_index, titles)
+        for row_index, row in enumerate(rows)
+        if (titles := row_header_title_work_items(row))
+    ]
 
     boundary_title_rows = broad_title_rows if broad_title_rows else title_rows
 
