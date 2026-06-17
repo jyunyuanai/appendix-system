@@ -762,10 +762,6 @@ def normalize_work_item_list(work_items: list[str]) -> list[tuple[str, str]]:
     ]
 
 
-def normalized_title_work_item(text: str) -> str:
-    return canonical_work_item_name(text)
-
-
 def normalized_work_item_matches_title(
     normalized_title: str,
     normalized_work_item: str,
@@ -777,12 +773,6 @@ def normalized_work_item_matches_title(
 
     return False
 
-
-def normalized_section_work_item_matches_title(
-    normalized_title: str,
-    normalized_work_item: str,
-) -> bool:
-    return normalized_work_item_matches_title(normalized_title, normalized_work_item)
 
 
 def normalized_text_contains_work_item_near_start(
@@ -817,13 +807,10 @@ def work_item_from_near_start_text(
 
 
 def work_item_title_matches(text: str, work_item: str) -> bool:
-    normalized_title = normalized_title_work_item(text)
+    normalized_title = canonical_work_item_name(text)
     normalized_work_item = canonical_work_item_name(work_item)
     return normalized_work_item_matches_title(normalized_title, normalized_work_item)
 
-
-def work_item_matches(text: str, work_item: str) -> bool:
-    return work_item_title_matches(text, work_item)
 
 
 def same_work_item_identity(left: str, right: str) -> bool:
@@ -850,7 +837,7 @@ def is_toc_header_row(text: str) -> bool:
 
 
 def row_matches_work_item(text: str, work_items: list[str]) -> bool:
-    return any(work_item_matches(text, work_item) for work_item in work_items)
+    return any(work_item_title_matches(text, work_item) for work_item in work_items)
 
 
 def toc_entry_matches_work_item_identity(entry_text: str, work_item: str) -> bool:
@@ -1014,7 +1001,7 @@ def xml_detect_section_work_item(
         matched_work_items = [
             work_item
             for work_item, normalized_work_item in normalized_work_items
-            if normalized_section_work_item_matches_title(
+            if normalized_work_item_matches_title(
                 normalized_title,
                 normalized_work_item,
             )
@@ -2092,7 +2079,7 @@ def element_title_conflicts_with_work_item(element_xml: bytes, work_item: str) -
     if element.tag != W_P:
         return False
 
-    title_work_items = element_title_work_items(element_xml)
+    title_work_items = xml_section_title_work_items(element)
     if not title_work_items:
         return False
     return not any(
@@ -2225,7 +2212,7 @@ def xml_table_slice_for_work_item(
         if (titles := row_header_title_work_items(row))
     ]
 
-    boundary_title_rows = broad_title_rows if broad_title_rows else title_rows
+    boundary_title_rows = broad_title_rows
 
     has_other_work_item = any(
         not title_work_items_match_work_item(titles, work_item)
@@ -2596,10 +2583,6 @@ def build_appendix_docx_fast(
         section.get("requested_work_item", section["work_item"])
         for section in selected_sections
     ]
-    toc_display_work_items = [
-        section.get("requested_work_item", section["work_item"])
-        for section in selected_sections
-    ]
 
     start_bookmark_names = [
         f"APPENDIX_{appendix_number}_{section_index + 1}_START"
@@ -2618,7 +2601,7 @@ def build_appendix_docx_fast(
             toc_work_items,
             appendix_number,
             start_bookmark_names,
-            toc_display_work_items,
+            toc_work_items,
         )
     ]
 
