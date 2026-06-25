@@ -3025,7 +3025,7 @@ if complete_clicked:
                     )
                 outputs[index] = {
                     "label": APPENDIX_NAMES[index],
-                    "file_name": f"{output_file_prefix}_{APPENDIX_NAMES[index]}.docx",
+                    "file_name": f"{APPENDIX_NAMES[index]}_{output_file_prefix}.docx",
                     "bytes": output_bytes,
                 }
 
@@ -3087,7 +3087,7 @@ if complete_clicked:
                         )
                     outputs[index] = {
                         "label": APPENDIX_NAMES[index],
-                        "file_name": f"{output_file_prefix}_{APPENDIX_NAMES[index]}.docx",
+                        "file_name": f"{APPENDIX_NAMES[index]}_{output_file_prefix}.docx",
                         "bytes": output_bytes,
                     }
 
