@@ -2421,6 +2421,18 @@ def xml_set_page_number_start(section_properties, start_number: int | None) -> N
     section_properties.insert(0, page_number_type)
 
 
+def xml_disable_doc_grid_lines(root) -> None:
+    """
+    來源範本各分節的「文件格線」設定不一致（部分頁面有開，部分沒開）。
+    合併輸出時，哪個分節的格線設定會保留到最終檔案是不固定的，
+    一旦保留到「有開格線」的分節，會讓行距變高，導致固定高度的文字方塊內容溢出。
+    這裡統一移除 docGrid 的 type 屬性（不使用格線），只影響格線這一項設定，
+    不動其他任何版面、字型、頁碼、目錄邏輯。
+    """
+    for doc_grid in root.xpath(".//w:docGrid", namespaces=WORD_NAMESPACES):
+        doc_grid.attrib.pop(f"{{{WORD_NAMESPACE}}}type", None)
+
+
 def xml_apply_appendix_section_settings(
     root,
     empty_footer_rid: str | None,
@@ -2542,6 +2554,7 @@ def replace_document_body_with_xml(
                         empty_footer_rid,
                         appendix_footer_rid,
                     )
+                    xml_disable_doc_grid_lines(root)
                     data = etree.tostring(
                         root,
                         xml_declaration=True,
