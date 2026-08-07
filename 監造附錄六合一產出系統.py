@@ -2810,6 +2810,21 @@ with work_item_column:
     )
     st.subheader("工項選擇表單")
 
+    st.caption("預設工項（可取消勾選，不需要就取消）")
+    default_work_item_columns = st.columns(len(DEFAULT_WORK_ITEMS))
+    checked_default_work_items = []
+    for default_column, default_work_item in zip(
+        default_work_item_columns, DEFAULT_WORK_ITEMS
+    ):
+        with default_column:
+            is_default_work_item_checked = st.checkbox(
+                default_work_item,
+                value=True,
+                key=f"default_work_item_checked_{default_work_item}",
+            )
+        if is_default_work_item_checked:
+            checked_default_work_items.append(default_work_item)
+
     selectable_work_items = [
         work_item
         for work_item in toc_work_items
@@ -2887,7 +2902,7 @@ with work_item_column:
         else:
             st.info("請先匯入 Word 檔案，系統會自動抓取目錄內容產生工項選單。")
 
-    output_work_items = list(dict.fromkeys(DEFAULT_WORK_ITEMS + selected_work_items))
+    output_work_items = list(dict.fromkeys(checked_default_work_items + selected_work_items))
     st.markdown("#### 本次產出工項")
     st.write("、".join(output_work_items))
 
