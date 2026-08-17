@@ -26,6 +26,8 @@ APPENDIX_NAMES = ["附錄一", "附錄二", "附錄三", "附錄四", "附錄五
 DEFAULT_WORK_ITEMS = ["放樣", "開挖", "回填", "便道"]
 UI_MASCOT_IMAGE = APP_DIR / "assets" / "ui_mascots.png"
 PREPARE_CACHE_VERSION = 56
+TEMPLATE_DIR = APP_DIR / "監造計劃書彙整docx"
+TEMPLATE_EXTENSIONS = (".docx", ".doc")
 MAX_PREPARE_WORKERS = 4
 MAX_OUTPUT_WORKERS = 6
 APPENDIX_CODE_PREFIXES = ["A", "B", "C", "D", "E", "F"]
@@ -299,6 +301,103 @@ def uploaded_payloads_signature(payloads: list[dict]) -> tuple[tuple[str, int, s
         (payload["name"], payload["size"], payload["type"], payload["digest"])
         for payload in payloads
     )
+
+
+def template_paths_by_position() -> dict[int, Path]:
+    """
+    掃描範本資料夾裡的檔案，用檔名判斷對應附錄一~六（跟上傳檔案用同一套判斷邏輯），
+    不要求固定檔名，例如「監造計畫書(附錄1-施工抽查程序流程圖)彙總yo修.docx」也認得出來。
+    """
+    if not TEMPLATE_DIR.is_dir():
+        return {}
+
+    candidate_paths = sorted(
+        path
+        for path in TEMPLATE_DIR.iterdir()
+        if path.is_file() and path.suffix.lower() in TEMPLATE_EXTENSIONS
+    )
+
+    paths_by_position = {}
+    fallback_paths = []
+    for path in candidate_paths:
+        position = appendix_position_from_filename(path.name)
+        if position is not None and position not in paths_by_position:
+            paths_by_position[position] = path
+        else:
+            fallback_paths.append(path)
+
+    available_positions = [
+        position
+        for position in range(len(APPENDIX_NAMES))
+        if position not in paths_by_position
+    ]
+    for path, position in zip(fallback_paths, available_positions):
+        paths_by_position[position] = path
+
+    return paths_by_position
+
+
+def read_template_payloads() -> dict[int, dict]:
+    """讀取範本資料夾裡已儲存的預設附錄檔案（不用每次上傳）。"""
+    payloads_by_position = {}
+    for position, template_path in template_paths_by_position().items():
+        file_bytes = template_path.read_bytes()
+        payloads_by_position[position] = {
+            "position": position,
+            "name": template_path.name,
+            "bytes": file_bytes,
+            "size": len(file_bytes),
+            "type": "",
+            "digest": bytes_digest(file_bytes),
+            "source": "範本",
+        }
+    return payloads_by_position
+
+
+def save_template_payload(position: int, name: str, file_bytes: bytes) -> None:
+    """
+    把這次上傳的檔案存回範本資料夾，變成之後的預設值。
+    這個位置本來就有檔案的話，直接覆蓋原檔名；沒有的話才用附錄編號新建檔名。
+    """
+    if not (0 <= position < len(APPENDIX_NAMES)):
+        return
+    TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    existing_path = template_paths_by_position().get(position)
+    if existing_path is not None:
+        existing_path.write_bytes(file_bytes)
+        return
+
+    extension = Path(name).suffix.lower()
+    if extension not in TEMPLATE_EXTENSIONS:
+        extension = ".docx"
+    (TEMPLATE_DIR / f"{APPENDIX_NAMES[position]}{extension}").write_bytes(file_bytes)
+
+
+def merged_upload_payloads(uploaded_files) -> list[dict]:
+    """
+    本次上傳的檔案優先使用，並存回範本資料夾成為新預設值；
+    沒有上傳的附錄位置，沿用範本資料夾裡既有的檔案。
+    """
+    uploaded_payloads_by_position = {
+        payload["position"]: dict(payload, source="本次上傳")
+        for payload in uploaded_file_payloads(uploaded_files)
+    }
+
+    existing_template_paths = template_paths_by_position()
+    for position, payload in uploaded_payloads_by_position.items():
+        existing_path = existing_template_paths.get(position)
+        existing_digest = (
+            bytes_digest(existing_path.read_bytes()) if existing_path is not None else None
+        )
+        if payload["digest"] != existing_digest:
+            save_template_payload(position, payload["name"], payload["bytes"])
+
+    payloads_by_position = dict(uploaded_payloads_by_position)
+    for position, payload in read_template_payloads().items():
+        payloads_by_position.setdefault(position, payload)
+
+    return [payloads_by_position[position] for position in sorted(payloads_by_position)]
 
 
 def sanitize_filename_part(name: str) -> str:
@@ -2695,23 +2794,35 @@ upload_column, work_item_column = st.columns([1, 2.2], gap="large")
 with upload_column:
     st.subheader("Word 檔案匯入")
     uploaded_files = st.file_uploader(
-        "一次拖曳 6 個 Word 檔案",
+        "只需上傳要更新的附錄，其餘沿用已儲存的範本",
         type=["doc", "docx"],
         accept_multiple_files=True,
         key="appendix_files",
     )
     uploaded_files = uploaded_files or []
 
-    if uploaded_files:
-        if len(uploaded_files) != len(APPENDIX_NAMES):
-            st.warning("請一次上傳 6 個 Word 檔案，依序對應附錄一到附錄六。")
+    uploaded_payloads = merged_upload_payloads(uploaded_files)
+    covered_positions = {payload["position"] for payload in uploaded_payloads}
+    missing_positions = [
+        position
+        for position in range(len(APPENDIX_NAMES))
+        if position not in covered_positions
+    ]
 
-        with st.container(border=True):
-            st.markdown("#### 檔案對應")
-            for payload in uploaded_file_payloads(uploaded_files):
-                st.write(f"{APPENDIX_NAMES[payload['position']]}：{payload['name']}")
-
-uploaded_payloads = uploaded_file_payloads(uploaded_files)
+    with st.container(border=True):
+        st.markdown("#### 檔案對應")
+        if uploaded_payloads:
+            for payload in uploaded_payloads:
+                st.write(
+                    f"{APPENDIX_NAMES[payload['position']]}："
+                    f"{payload['name']}（{payload.get('source', '範本')}）"
+                )
+        if missing_positions:
+            st.warning(
+                "尚未有範本可用："
+                + "、".join(APPENDIX_NAMES[position] for position in missing_positions)
+                + "，請上傳對應檔案。"
+            )
 toc_source_position = toc_source_position_from_payloads(uploaded_payloads)
 current_upload_signature = (
     PREPARE_CACHE_VERSION,
@@ -2721,7 +2832,7 @@ prepare_cache = st.session_state.setdefault("prepare_cache", {})
 index_cache = st.session_state.setdefault("index_cache", {})
 output_cache = st.session_state.setdefault("output_cache", {})
 
-if not uploaded_files:
+if len(uploaded_payloads) != len(APPENDIX_NAMES):
     st.session_state["prepared_upload_signature"] = ()
     st.session_state["prepared_uploads"] = []
     st.session_state["toc_work_items"] = []
@@ -2926,8 +3037,8 @@ with action_column:
 if complete_clicked:
     if outputs_are_current:
         st.success("已沿用上次產出結果，可直接下載。")
-    elif len(uploaded_files) != len(APPENDIX_NAMES):
-        st.error("請先一次上傳 6 個 Word 檔案。")
+    elif len(uploaded_payloads) != len(APPENDIX_NAMES):
+        st.error("附錄一到附錄六尚未齊全，請上傳缺少的檔案。")
     elif not output_work_items:
         st.error("請至少選擇一個要產出的工項。")
     elif any(upload["docx_bytes"] is None for upload in prepared_uploads):
