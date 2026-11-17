@@ -835,6 +835,14 @@ def canonical_work_item_name(text: str) -> str:
         # 附錄2、3、5、6的標題都寫成「輕質擋土牆」，但使用者選的工項是「輕質擋土」，
         # 兩者視為同一工項，避免該工項被當成找不到而漏抓。
         "輕質擋土牆": "輕質擋土",
+        # 附錄2寫成「木構擋土牆」，附錄4~6寫成「木構檔」，與選單的「木構擋土」視為同一工項。
+        "木構擋土牆": "木構擋土",
+        "木構檔": "木構擋土",
+        # 附錄4、5寫成「架高地板」，附錄6寫成「架高地鈑」，與選單的「架高地版」視為同一工項。
+        "架高地板": "架高地版",
+        "架高地鈑": "架高地版",
+        # 附錄6寫成「景觀燈」，與選單的「景觀高燈」視為同一工項。
+        "景觀燈": "景觀高燈",
     }
     if normalized in ("瀝青混凝土鋪面", "混凝土鋪面"):
         return f"{normalized}工程"
@@ -2565,6 +2573,56 @@ def xml_enable_update_fields(settings_xml: bytes) -> bytes:
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
 
 
+def docx_make_toc_pages_static(docx_bytes: bytes) -> bytes:
+    """沒有 Word 可校正頁碼時（雲端）使用。
+
+    把目錄頁碼的 PAGEREF 功能變數改成純文字（保留原本的預估頁碼），
+    並關閉「開啟時更新功能變數」，避免開檔跳出詢問視窗、
+    也避免 Word 把頁碼全部更新成 1。失敗時原樣回傳。
+    """
+    try:
+        output_stream = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(docx_bytes), "r") as source_zip:
+            with zipfile.ZipFile(output_stream, "w") as output_zip:
+                for item in source_zip.infolist():
+                    data = source_zip.read(item.filename)
+                    if item.filename == "word/document.xml":
+                        root = etree.fromstring(data)
+                        for field in root.xpath(
+                            ".//w:fldSimple[contains(@w:instr, 'PAGEREF APPENDIX_')]",
+                            namespaces=WORD_NAMESPACES,
+                        ):
+                            parent = field.getparent()
+                            position = parent.index(field)
+                            for child in list(field):
+                                parent.insert(position, child)
+                                position += 1
+                            parent.remove(field)
+                        data = etree.tostring(
+                            root,
+                            xml_declaration=True,
+                            encoding="UTF-8",
+                            standalone=True,
+                        )
+                    elif item.filename == "word/settings.xml":
+                        root = etree.fromstring(data)
+                        for update_fields in root.findall(
+                            "./w:updateFields",
+                            namespaces=WORD_NAMESPACES,
+                        ):
+                            root.remove(update_fields)
+                        data = etree.tostring(
+                            root,
+                            xml_declaration=True,
+                            encoding="UTF-8",
+                            standalone=True,
+                        )
+                    output_zip.writestr(item, data)
+        return output_stream.getvalue()
+    except Exception:
+        return docx_bytes
+
+
 def refresh_docx_fields_with_word(
     docx_bytes: bytes,
     appendix_number: int | None = None,
@@ -2777,12 +2835,15 @@ def build_appendix_docx_fast(
         body_elements,
         appendix_number,
     )
-    output_bytes = refresh_docx_fields_with_word(
+    refreshed_bytes = refresh_docx_fields_with_word(
         output_bytes,
         appendix_number,
         toc_page_range_bookmarks,
     )
-    return output_bytes, len(selected_sections), missing_work_items
+    if refreshed_bytes is output_bytes:
+        # Word 沒有處理（雲端或 Word 失敗）：改用純文字頁碼，不留功能變數。
+        refreshed_bytes = docx_make_toc_pages_static(output_bytes)
+    return refreshed_bytes, len(selected_sections), missing_work_items
 
 
 st.set_page_config(page_title="監造附錄六合一產出系統", layout="wide")
